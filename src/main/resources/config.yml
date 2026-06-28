@@ -4,7 +4,7 @@
 
 # Your Discord webhook URL.
 # Create one in Discord: Channel Settings → Integrations → Webhooks
-webhook-url: "https://discord.com/api/webhooks/1519032945577562195/oR3c5IEbueFZtJv3Yc-klSl93_v3yuaVz_bWdzYBF9vEVjZIQNdq-AoBZL1I0bqVPPK0"
+webhook-url: "https://discord.com/api/webhooks/"
 
 # ──────────────────────────────────────────────────────────
 # WHAT ITEMS TO WATCH
