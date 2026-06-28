@@ -143,7 +143,7 @@ head-url: "https://mc-heads.net/avatar/{name}/64"
 
 auto-ban:
   # Set to true to enable automatic banning when a stash is detected.
-  enabled: false
+  enabled: true
 
   # The console command to execute. Use {player} and {reason} as placeholders.
   command: "ban {player} {reason}"
