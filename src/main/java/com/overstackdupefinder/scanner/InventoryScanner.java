@@ -136,19 +136,33 @@ public class InventoryScanner {
                 if (alerts.isEmpty()) return;
 
                 java.util.Set<String> bannedThisCycle = new java.util.HashSet<>();
+                PluginConfig cfg = payload.cfg;
 
                 for (AlertData alert : alerts) {
-                    plugin.getWebhookManager().sendAlert(alert);
+                    // 1. Send Alert Webhook (Respect alert cooldowns)
+                    if (checkAndSetCooldown(alert.getCooldownKey(), cfg)) {
+                        if (cfg.isDebug()) {
+                            log.info("[DEBUG] Webhook alert suppressed by cooldown for key: " + alert.getCooldownKey());
+                        }
+                    } else {
+                        plugin.getWebhookManager().sendAlert(alert);
+                    }
 
-                    // Auto-ban
-                    PluginConfig cfg = payload.cfg;
-                    if (cfg.isAutoBanEnabled()
-                            && alert.shouldAutoBan()
-                            && bannedThisCycle.add(alert.getPlayerName())) {
-                        String banReason = alert.getBanReason().isBlank()
-                                ? cfg.getAutoBanReason()
-                                : alert.getBanReason();
-                        executeBan(alert.getPlayerName(), banReason, cfg);
+                    // 2. Process Auto-Ban (Completely bypasses webhook/alert cooldowns)
+                    if (alert.shouldAutoBan()) {
+                        if (cfg.isAutoBanEnabled()) {
+                            if (bannedThisCycle.add(alert.getPlayerName())) {
+                                String banReason = alert.getBanReason().isBlank()
+                                        ? cfg.getAutoBanReason()
+                                        : alert.getBanReason();
+                                executeBan(alert.getPlayerName(), banReason, cfg);
+                            }
+                        } else {
+                            log.warning("[AutoBan] Player " + alert.getPlayerName()
+                                    + " exceeded ban limit for " + alert.getItemLabel()
+                                    + " (" + alert.getTotalItemCount() + "/" + alert.getBanLimit()
+                                    + ") but auto-ban is disabled in config!");
+                        }
                     }
                 }
             }, executor)
@@ -168,12 +182,19 @@ public class InventoryScanner {
                 .replace("{player}", playerName)
                 .replace("{reason}",  banReason);
 
-        log.warning("[AutoBan] Executing: " + cmd);
+        log.warning("[AutoBan] Executing command: " + cmd);
 
         // dispatchCommand MUST run on the main thread
-        plugin.getServer().getScheduler().runTask(plugin,
-                () -> plugin.getServer().dispatchCommand(
-                        plugin.getServer().getConsoleSender(), cmd));
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            boolean success = plugin.getServer().dispatchCommand(
+                    plugin.getServer().getConsoleSender(), cmd);
+            if (!success) {
+                log.severe("[AutoBan] FAILED to execute command as console: " + cmd
+                        + " (Command registered incorrectly, or plugin not loaded?)");
+            } else {
+                log.info("[AutoBan] Command executed successfully: " + cmd);
+            }
+        });
 
         // HTTP — fine on virtual thread
         if (cfg.isAutoBanNotifyDiscord()) {
@@ -226,14 +247,13 @@ public class InventoryScanner {
 
                 if (total < threshold) continue;
 
-                AlertSource src     = p.isChest ? AlertSource.CHEST : AlertSource.PLAYER_INVENTORY;
-                String      coolKey = p.uuid + ":" + miId + ":" + src.name();
-                if (checkAndSetCooldown(coolKey, cfg, dbg)) continue;
+                AlertSource src       = p.isChest ? AlertSource.CHEST : AlertSource.PLAYER_INVENTORY;
+                String      coolKey   = p.uuid + ":" + miId + ":" + src.name();
+                String      container = p.isChest ? "Chest" : "Player Inventory";
+                String      label     = mi.getMaterial() != null ? mi.getMaterial().name() : miId;
 
-                String container = p.isChest ? "Chest" : "Player Inventory";
-                String label     = mi.getMaterial() != null ? mi.getMaterial().name() : miId;
                 results.add(new AlertData(p.uuid, p.playerName, p.playerLoc, p.chestLoc, label,
-                        stacks, total, src, container, mi.getBanLimit(), mi.getBanReason()));
+                        stacks, total, src, container, mi.getBanLimit(), mi.getBanReason(), coolKey));
             }
         }
 
@@ -276,11 +296,10 @@ public class InventoryScanner {
 
                     AlertSource src     = p.isChest ? AlertSource.SHULKER_IN_CHEST : AlertSource.SHULKER_IN_INVENTORY;
                     String      coolKey = p.uuid + ":" + miId + ":" + src.name() + ":" + shulkerType;
-                    if (checkAndSetCooldown(coolKey, cfg, dbg)) continue;
+                    String      label   = mi.getMaterial() != null ? mi.getMaterial().name() : miId;
 
-                    String label = mi.getMaterial() != null ? mi.getMaterial().name() : miId;
                     results.add(new AlertData(p.uuid, p.playerName, p.playerLoc, p.chestLoc, label,
-                            stacks, total, src, prettyName(shulkerType), mi.getBanLimit(), mi.getBanReason()));
+                            stacks, total, src, prettyName(shulkerType), mi.getBanLimit(), mi.getBanReason(), coolKey));
                 }
             }
         }
@@ -342,15 +361,14 @@ public class InventoryScanner {
     }
 
     /**
-     * Returns true if {@code key} is on cooldown (skips alert), false if it was just set.
-     * Thread-safe via {@link ConcurrentHashMap}.
+     * Checks and updates cooldown.
+     * Returns true if on cooldown, false if not on cooldown.
      */
-    private boolean checkAndSetCooldown(String key, PluginConfig cfg, boolean dbg) {
+    private boolean checkAndSetCooldown(String key, PluginConfig cfg) {
         long now  = System.currentTimeMillis();
         Long last = cooldowns.get(key);
         if (last != null && (now - last) < cfg.getAlertCooldownSeconds() * 1000L) {
-            if (dbg) log.info("[DEBUG] On cooldown for " + key);
-            return true; // still on cooldown
+            return true; // Still on cooldown
         }
         cooldowns.put(key, now);
         return false;
