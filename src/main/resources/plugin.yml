@@ -1,0 +1,19 @@
+name: OverStackDupeFinder
+version: '${project.version}'
+main: com.overstackdupefinder.OverStackDupeFinder
+api-version: '1.21'
+description: Detects unusually large amounts of spawners in shulker boxes and sends a Discord webhook alert.
+author: Ace
+website: https://github.com/yourname/OverStackDupeFinder
+
+commands:
+  overstackdupe:
+    description: OverStackDupeFinder admin commands
+    usage: /overstackdupe reload
+    permission: overstackdupefinder.admin
+    aliases: [osd]
+
+permissions:
+  overstackdupefinder.admin:
+    description: Access to /overstackdupe command
+    default: op

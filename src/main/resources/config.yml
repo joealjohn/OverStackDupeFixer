@@ -1,0 +1,155 @@
+# ══════════════════════════════════════════════════════════
+#            OverStackDupeFinder  ·  Configuration
+# ══════════════════════════════════════════════════════════
+
+# Your Discord webhook URL.
+# Create one in Discord: Channel Settings → Integrations → Webhooks
+webhook-url: "https://discord.com/api/webhooks/1519032945577562195/oR3c5IEbueFZtJv3Yc-klSl93_v3yuaVz_bWdzYBF9vEVjZIQNdq-AoBZL1I0bqVPPK0"
+
+# ──────────────────────────────────────────────────────────
+# WHAT ITEMS TO WATCH
+# ──────────────────────────────────────────────────────────
+# Each entry supports these 6 fields:
+#
+#   material           → Minecraft item ID (ALL CAPS). Leave blank if using
+#                        custom-names only.
+#
+#   custom-names       → Words to match in an item's DISPLAY NAME.
+#                        E.g. "spawner" matches "Zombie Spawner", "Creeper Spawner".
+#                        Case-insensitive. Leave as [] if not needed.
+#
+#   alert-in-inventory → SEND ALERT when a player carries this many items
+#                        LOOSE in their inventory (raw item count, not stacks).
+#                        Set to -1 to disable.
+#
+#   alert-in-shulker   → SEND ALERT when a single shulker box contains this
+#                        many items inside it (raw item count).
+#                        Set to -1 to disable.
+#
+#   ban-limit          → AUTO-BAN the player when they have this many items.
+#                        Should be ≥ alert threshold. Requires auto-ban.enabled: true.
+#                        Set to -1 to never auto-ban for this item.
+#
+#   ban-reason         → Custom ban reason shown in Discord + LiteBans for
+#                        this specific item. Leave blank ("") to use the
+#                        global auto-ban.reason instead.
+
+monitored-items:
+
+  spawners:
+    material: "SPAWNER"
+    custom-names:
+      - "spawner"              # catches "Zombie Spawner", "Iron Golem Spawner", etc.
+    alert-in-inventory: 640   # ALERT if player has this many items loose in inventory
+    alert-in-shulker: 320     # ALERT if one shulker has this many items inside
+    ban-limit: 1280           # AUTO-BAN if they have this many items (must be ≥ alert)
+    ban-reason: "velo-panikum-poda"
+
+  netherite-blocks:
+    material: "NETHERITE_BLOCK"
+    custom-names: []
+    alert-in-inventory: 32    # ALERT at 32 netherite blocks
+    alert-in-shulker: 32
+    ban-limit: 50             # AUTO-BAN at 50 netherite blocks
+    ban-reason: "Dupe detected"
+
+  enchanted-golden-apples:
+    material: "ENCHANTED_GOLDEN_APPLE"
+    custom-names: []
+    alert-in-inventory: 32    # ALERT at 32 notch apples
+    alert-in-shulker: 32
+    ban-limit: 50             # AUTO-BAN at 50 notch apples
+    ban-reason: "Dupe detected"
+
+  netherite-ingots:
+    material: "NETHERITE_INGOT"
+    custom-names: []
+    alert-in-inventory: 128   # ALERT at 128 netherite ingots
+    alert-in-shulker: 128
+    ban-limit: 200            # AUTO-BAN at 200 netherite ingots
+    ban-reason: "Dupe detected"
+
+  # ── Add more items below (copy and paste the block above) ──────────────────
+  # example-diamonds:
+  #   material: "DIAMOND"
+  #   custom-names: []
+  #   alert-in-inventory: 1728
+  #   alert-in-shulker: -1
+  #   ban-limit: -1             # -1 = never auto-ban for this item
+  #   ban-reason: ""            # leave blank to use global auto-ban.reason
+
+# ──────────────────────────────────────────────────────────
+# WHAT TO SCAN
+# ──────────────────────────────────────────────────────────
+
+# Check items sitting directly in a player's hotbar/inventory?
+scan-player-inventory: true
+
+# Check inside shulker boxes found in player inventories?
+scan-shulker-contents: true
+
+# ── Chest scanning (triggers when a player OPENS a chest/barrel) ────────────
+
+# Alert if a chest contains monitored items sitting LOOSE directly inside?
+scan-chests-loose-items: true
+
+# Alert if a chest contains shulker boxes that have monitored items inside?
+# e.g. a chest full of shulkers, each packed with spawners → sends alert.
+scan-chests-shulkers: true
+
+# ──────────────────────────────────────────────────────────
+# TIMING & COOLDOWNS
+# ──────────────────────────────────────────────────────────
+
+# How often (seconds) all online players' inventories are scanned automatically.
+# Lower = more responsive, higher = less server load. Minimum: 1
+scan-interval-seconds: 5
+
+# Minimum seconds before the same player triggers the same alert again.
+# Prevents spam if they stand still with a full shulker.
+alert-cooldown-seconds: 60
+
+# ──────────────────────────────────────────────────────────
+# LOGGING & DEBUG
+# ──────────────────────────────────────────────────────────
+
+# Also print alerts in the server console?
+log-to-console: true
+
+# Show detailed debug messages in console?
+# Turn ON if alerts aren't firing — it will explain exactly what was found.
+debug: false
+
+# ──────────────────────────────────────────────────────────
+# DISCORD EMBED OPTIONS
+# ──────────────────────────────────────────────────────────
+
+# URL used to show the player's head icon in the Discord alert.
+# {name} works on offline-mode servers. {uuid} requires online mode.
+head-url: "https://mc-heads.net/avatar/{name}/64"
+
+# ──────────────────────────────────────────────────────────
+# AUTO-BAN ON DETECTION
+# ──────────────────────────────────────────────────────────
+# When suspicious items are detected, automatically run a console command
+# to ban the player. Works with LiteBans, AdvancedBan, vanilla — any plugin.
+#
+# {player}  → replaced with the player's name
+# {reason}  → replaced with the ban-reason below
+#
+# LiteBans example:   "ban {player} {reason}"
+# LiteBans temp-ban:  "tempban {player} 7d {reason}"
+# Vanilla example:    "ban {player} {reason}"
+
+auto-ban:
+  # Set to true to enable automatic banning when a stash is detected.
+  enabled: false
+
+  # The console command to execute. Use {player} and {reason} as placeholders.
+  command: "ban {player} {reason}"
+
+  # The ban reason shown to the player and in Discord.
+  reason: "Suspicious item stash detected by OverStackDupeFinder"
+
+  # Send a separate green Discord embed when the ban is executed?
+  notify-discord: true
