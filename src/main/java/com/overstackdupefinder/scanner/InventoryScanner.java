@@ -21,43 +21,46 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
+import java.util.logging.Logger;
 
 /**
  * Fully asynchronous inventory scanner.
  *
- * <h3>Detection scopes</h3>
- * <ol>
- *   <li><b>Loose inventory</b>: counts monitored items directly in the player's
- *       inventory (not inside shulkers). Threshold: {@code threshold-inventory}.</li>
- *   <li><b>Shulker contents</b>: opens each shulker box found in the inventory
- *       (or chest) and counts monitored items inside. Threshold: {@code threshold-shulker}.</li>
- *   <li><b>Chest contents</b>: when a player opens a chest/barrel, the same
- *       logic runs on that container's slots.</li>
- * </ol>
- *
- * <h3>Threading model</h3>
+ * <h3>Threading model — strict rules</h3>
  * <pre>
- *  Main thread   → snapshotAnd*()   — takes array copy of inventory  (~µs)
- *  Virtual thread→ analyzeSnapshot() — reads ItemMeta / counts items  (CPU only)
- *  Virtual thread→ WebhookManager   — HTTP POST to Discord
+ *  Main thread   → snapshotAnd*()
+ *                  - deepCopy() outer inventory                         (~µs)
+ *                  - extractShulkerContents() — reads BlockStateMeta,
+ *                    deep-copies each shulker's inner inventory         (~µs)
+ *                  → hands ScanPayload to virtual thread immediately
+ *
+ *  Virtual thread→ analyzePayload() — pure arithmetic on pre-copied arrays
+ *  Virtual thread→ WebhookManager.send*() — HTTP POST to Discord
+ *  Main thread   → executeBan() — dispatchCommand (scheduled back)
  * </pre>
+ *
+ * <p><b>No Bukkit/Paper API is called off the main thread.</b>
+ * {@code ItemStack.getItemMeta()} and {@code BlockStateMeta} access are
+ * performed exclusively during the main-thread snapshot phase.</p>
  */
 public class InventoryScanner {
 
     private final OverStackDupeFinder plugin;
-    private final ExecutorService executor;
+    private final ExecutorService     executor;
+    private final Logger              log;
 
-    /** Key: "uuid:monitoredItemId:source" */
+    /** Key: "uuid:monitoredItemId:source[:shulkerType]" → last alert timestamp */
     private final Map<String, Long> cooldowns = new ConcurrentHashMap<>();
 
     public InventoryScanner(OverStackDupeFinder plugin, ExecutorService executor) {
         this.plugin   = plugin;
         this.executor = executor;
+        this.log      = plugin.getLogger();
     }
 
-    // ── Public API (main thread) ───────────────────────────────────────────────
+    // ══ Public API — MUST be called from main thread ══════════════════════════
 
-    /** Snapshots all online players and submits async analysis. Called from timer. */
+    /** Snapshots all online players and submits async analysis. */
     public void snapshotAndScanAll() {
         for (Player player : plugin.getServer().getOnlinePlayers()) {
             snapshotAndScanPlayer(player);
@@ -66,77 +69,98 @@ public class InventoryScanner {
 
     /** Snapshots a single player's inventory and submits async analysis. */
     public void snapshotAndScanPlayer(Player player) {
-        // MUST snapshot on main thread — getContents() returns a copy of the array,
-        // but each ItemStack in it is a reference. We clone what we need.
-        ItemStack[] raw = player.getInventory().getContents();
-        ItemStack[] snapshot = deepCopy(raw);
-
-        UUID     uuid = player.getUniqueId();
-        String   name = player.getName();
-        Location loc  = player.getLocation().clone();
-
-        submitAnalysis(snapshot, uuid, name, loc, false);
+        ItemStack[] raw      = player.getInventory().getContents();
+        ScanPayload payload  = buildPayload(raw, player.getUniqueId(), player.getName(),
+                                            player.getLocation().clone(), null, false);
+        submitAnalysis(payload);
     }
 
-    /**
-     * Snapshots a chest inventory and submits async analysis.
-     *
-     * @param chestContents the chest's inventory contents
-     * @param player        the player who opened the chest
-     * @param playerLoc     the player's location at the time of opening
-     * @param chestLoc      the chest block's location (shown separately in Discord alert)
-     */
+    /** Snapshots a chest and submits async analysis. */
     public void snapshotAndScanChest(ItemStack[] chestContents, Player player,
                                      Location playerLoc, Location chestLoc) {
-        ItemStack[] snapshot = deepCopy(chestContents);
-        submitAnalysis(snapshot, player.getUniqueId(), player.getName(),
-                playerLoc.clone(), chestLoc != null ? chestLoc.clone() : null, true);
+        ScanPayload payload = buildPayload(chestContents, player.getUniqueId(), player.getName(),
+                                           playerLoc.clone(),
+                                           chestLoc != null ? chestLoc.clone() : null,
+                                           true);
+        submitAnalysis(payload);
     }
 
     public void clearCooldowns() { cooldowns.clear(); }
 
-    // ── Async pipeline ────────────────────────────────────────────────────────
+    // ══ Main-thread snapshot helpers ══════════════════════════════════════════
 
-    private void submitAnalysis(ItemStack[] snapshot, UUID uuid, String playerName,
-                                 Location loc, boolean isChest) {
-        submitAnalysis(snapshot, uuid, playerName, loc, null, isChest);
+    /**
+     * Builds a fully immutable {@link ScanPayload} on the main thread.
+     *
+     * <p>This is the ONLY place where {@code ItemMeta} / {@code BlockStateMeta} is read —
+     * guaranteeing all Bukkit API calls happen synchronously.</p>
+     */
+    private ScanPayload buildPayload(ItemStack[] raw, UUID uuid, String playerName,
+                                     Location playerLoc, Location chestLoc, boolean isChest) {
+        int len          = raw.length;
+        ItemStack[] outer = new ItemStack[len];   // deep-copied outer slots
+        // shulkerSlots[i] = deep-copied inner inventory of shulker at slot i, or null
+        ItemStack[][] shulkerSlots = new ItemStack[len][];
+        String[]      shulkerTypes = new String[len];
+
+        for (int i = 0; i < len; i++) {
+            ItemStack item = raw[i];
+            if (item == null) continue;
+
+            // Clone the outer slot unconditionally
+            outer[i] = item.clone();
+
+            // If it's a shulker box, extract its inner inventory NOW (main thread)
+            if (isShulkerBox(item.getType())) {
+                // getItemMeta() — main thread only
+                if (item.getItemMeta() instanceof BlockStateMeta bsm
+                        && bsm.getBlockState() instanceof ShulkerBox shulker) {
+                    ItemStack[] inner = shulker.getInventory().getContents();
+                    shulkerSlots[i] = deepCopy(inner);
+                    shulkerTypes[i] = item.getType().name();
+                }
+            }
+        }
+
+        return new ScanPayload(uuid, playerName, playerLoc, chestLoc, isChest,
+                               outer, shulkerSlots, shulkerTypes,
+                               plugin.getPluginConfig()); // snapshot config reference
     }
 
-    private void submitAnalysis(ItemStack[] snapshot, UUID uuid, String playerName,
-                                 Location playerLoc, Location chestLoc, boolean isChest) {
+    // ══ Async pipeline ════════════════════════════════════════════════════════
+
+    private void submitAnalysis(ScanPayload payload) {
         CompletableFuture
-            .supplyAsync(() -> analyzeSnapshot(snapshot, uuid, playerName, playerLoc, chestLoc, isChest), executor)
-            .thenAccept(alerts -> {
+            .supplyAsync(() -> analyzePayload(payload), executor)
+            .thenAcceptAsync(alerts -> {
                 if (alerts.isEmpty()) return;
 
-                // Track players already banned in this batch to avoid duplicate bans
                 java.util.Set<String> bannedThisCycle = new java.util.HashSet<>();
 
                 for (AlertData alert : alerts) {
                     plugin.getWebhookManager().sendAlert(alert);
 
-                                    // Auto-ban — dispatched on main thread (Bukkit requirement)
-                    PluginConfig cfg = plugin.getPluginConfig();
-                    if (cfg.isAutoBanEnabled() && alert.shouldAutoBan()
+                    // Auto-ban
+                    PluginConfig cfg = payload.cfg;
+                    if (cfg.isAutoBanEnabled()
+                            && alert.shouldAutoBan()
                             && bannedThisCycle.add(alert.getPlayerName())) {
-                        // Use item-specific reason if set, otherwise global reason
                         String banReason = alert.getBanReason().isBlank()
                                 ? cfg.getAutoBanReason()
                                 : alert.getBanReason();
                         executeBan(alert.getPlayerName(), banReason, cfg);
                     }
                 }
-            })
+            }, executor)
             .exceptionally(ex -> {
-                plugin.getLogger().warning("[OverStackDupeFinder] Analysis error: " + ex.getMessage());
+                log.warning("[OverStackDupeFinder] Analysis error: " + ex.getMessage());
                 ex.printStackTrace();
                 return null;
             });
     }
 
     /**
-     * Schedules a console command on the main thread to ban a player.
-     * Also sends a Discord ban embed if configured.
+     * Dispatches a ban command on the main thread and optionally sends a Discord embed.
      * Safe to call from any thread.
      */
     private void executeBan(String playerName, String banReason, PluginConfig cfg) {
@@ -144,145 +168,119 @@ public class InventoryScanner {
                 .replace("{player}", playerName)
                 .replace("{reason}",  banReason);
 
-        plugin.getLogger().warning("[AutoBan] Executing: " + cmd);
+        log.warning("[AutoBan] Executing: " + cmd);
 
         // dispatchCommand MUST run on the main thread
-        plugin.getServer().getScheduler().runTask(plugin, () ->
-            plugin.getServer().dispatchCommand(
-                plugin.getServer().getConsoleSender(), cmd)
-        );
+        plugin.getServer().getScheduler().runTask(plugin,
+                () -> plugin.getServer().dispatchCommand(
+                        plugin.getServer().getConsoleSender(), cmd));
 
-        // Send green Discord ban embed (runs on this virtual thread — HTTP is fine)
+        // HTTP — fine on virtual thread
         if (cfg.isAutoBanNotifyDiscord()) {
             plugin.getWebhookManager().sendBanAlert(playerName, banReason);
         }
     }
 
+    // ══ Pure analysis — safe on any thread (no Bukkit API) ═══════════════════
+
     /**
-     * Pure analysis — safe to run on any thread.
-     * Scans both loose items in the container AND items inside shulker boxes.
+     * Analyses a pre-snapshotted {@link ScanPayload}.
+     * All data here is plain Java objects — no Bukkit API calls.
      */
-    private List<AlertData> analyzeSnapshot(ItemStack[] contents, UUID uuid, String playerName,
-                                             Location playerLoc, Location chestLoc, boolean isChest) {
-        List<AlertData>      results  = new ArrayList<>();
-        PluginConfig         cfg      = plugin.getPluginConfig();
-        List<MonitoredItem>  monitored = cfg.getMonitoredItems();
-        boolean              dbg      = cfg.isDebug();
+    private List<AlertData> analyzePayload(ScanPayload p) {
+        List<AlertData>     results   = new ArrayList<>();
+        PluginConfig        cfg       = p.cfg;
+        List<MonitoredItem> monitored = cfg.getMonitoredItems();
+        boolean             dbg       = cfg.isDebug();
 
-        // ── 1. Count LOOSE items (not inside shulkers) ────────────────────────
-        boolean scanLoose = isChest ? cfg.isScanChestsLooseItems() : cfg.isScanPlayerInventory();
+        // ── 1. Loose items (skip shulker slots) ───────────────────────────────
+        boolean scanLoose = p.isChest ? cfg.isScanChestsLooseItems() : cfg.isScanPlayerInventory();
         if (scanLoose) {
-            Map<String, int[]> looseCounts = new HashMap<>(); // monitoredItem.id → [totalItems, stackSize]
+            Map<String, int[]> counts = new HashMap<>(); // id → [total, stackSize]
 
-            for (ItemStack item : contents) {
+            for (ItemStack item : p.outerSlots) {
                 if (item == null) continue;
-                if (isShulkerBox(item.getType())) continue; // shulkers handled below
+                if (isShulkerBox(item.getType())) continue; // handled in shulker section
 
-                MonitoredItem matched = matchItem(item, monitored);
-                if (matched == null) continue;
+                MonitoredItem mi = matchItem(item, monitored);
+                if (mi == null) continue;
 
-                looseCounts.computeIfAbsent(matched.getId(), k -> new int[]{0, resolveStackSize(item, matched)});
-                looseCounts.get(matched.getId())[0] += item.getAmount();
+                counts.computeIfAbsent(mi.getId(), k -> new int[]{0, stackSizeOf(item, mi)});
+                counts.get(mi.getId())[0] += item.getAmount();
             }
 
-            for (Map.Entry<String, int[]> entry : looseCounts.entrySet()) {
-                String miId      = entry.getKey();
-                int    total     = entry.getValue()[0];
-                int    stackSize = entry.getValue()[1];
+            for (Map.Entry<String, int[]> e : counts.entrySet()) {
+                String miId      = e.getKey();
+                int    total     = e.getValue()[0];
+                int    stackSize = e.getValue()[1];
                 int    stacks    = (int) Math.ceil((double) total / stackSize);
 
                 MonitoredItem mi = findById(monitored, miId);
                 if (mi == null) continue;
                 int threshold = mi.getThresholdInventory();
-                if (threshold < 0) continue; // disabled
+                if (threshold < 0) continue;
 
-                if (dbg) {
-                    plugin.getLogger().info("[DEBUG] " + playerName + " loose | item='" + miId +
-                            "' total=" + total + " threshold=" + threshold +
-                            " source=" + (isChest ? "CHEST" : "INVENTORY"));
-                }
+                if (dbg) log.info("[DEBUG] " + p.playerName + " loose | item='" + miId +
+                        "' total=" + total + " threshold=" + threshold +
+                        " source=" + (p.isChest ? "CHEST" : "INVENTORY"));
 
-                if (total < threshold) continue; // threshold is raw item count
+                if (total < threshold) continue;
 
-                AlertSource src = isChest ? AlertSource.CHEST : AlertSource.PLAYER_INVENTORY;
-                String coolKey  = uuid + ":" + miId + ":" + src.name();
-                if (isOnCooldown(coolKey)) {
-                    if (dbg) plugin.getLogger().info("[DEBUG] On cooldown for " + coolKey);
-                    continue;
-                }
-                setCooldown(coolKey);
+                AlertSource src     = p.isChest ? AlertSource.CHEST : AlertSource.PLAYER_INVENTORY;
+                String      coolKey = p.uuid + ":" + miId + ":" + src.name();
+                if (checkAndSetCooldown(coolKey, cfg, dbg)) continue;
 
-                String container = isChest ? "Chest" : "Player Inventory";
+                String container = p.isChest ? "Chest" : "Player Inventory";
                 String label     = mi.getMaterial() != null ? mi.getMaterial().name() : miId;
-
-                results.add(new AlertData(uuid, playerName, playerLoc, chestLoc, label,
+                results.add(new AlertData(p.uuid, p.playerName, p.playerLoc, p.chestLoc, label,
                         stacks, total, src, container, mi.getBanLimit(), mi.getBanReason()));
             }
         }
 
-        // ── 2. Scan INSIDE shulker boxes ──────────────────────────────────────
-        boolean scanShulkers = isChest ? cfg.isScanChestsShulkers() : cfg.isScanShulkerContents();
+        // ── 2. Shulker contents ───────────────────────────────────────────────
+        boolean scanShulkers = p.isChest ? cfg.isScanChestsShulkers() : cfg.isScanShulkerContents();
         if (scanShulkers) {
-            for (ItemStack item : contents) {
-                if (item == null) continue;
-                if (!isShulkerBox(item.getType())) continue;
+            for (int i = 0; i < p.outerSlots.length; i++) {
+                ItemStack[] inner    = p.shulkerSlots[i];
+                String      shulkerType = p.shulkerTypes[i];
+                if (inner == null || shulkerType == null) continue;
 
-                // Peek inside the shulker — getItemMeta() returns a copy, thread-safe
-                if (!(item.getItemMeta() instanceof BlockStateMeta bsm)) continue;
-                if (!(bsm.getBlockState() instanceof ShulkerBox shulker)) continue;
+                if (dbg) log.info("[DEBUG] " + p.playerName + " shulker=" + shulkerType +
+                        " slots=" + inner.length + " source=" + (p.isChest ? "CHEST" : "INVENTORY"));
 
-                ItemStack[] inner = shulker.getInventory().getContents();
-                String shulkerName = item.getType().name();
-
-                if (dbg) {
-                    plugin.getLogger().info("[DEBUG] " + playerName + " shulker=" +
-                            shulkerName + " slots=" + inner.length +
-                            " source=" + (isChest ? "CHEST" : "INVENTORY"));
-                }
-
-                // Count monitored items inside this shulker
                 Map<String, int[]> shulkerCounts = new HashMap<>();
 
                 for (ItemStack slot : inner) {
                     if (slot == null) continue;
-
-                    MonitoredItem matched = matchItem(slot, monitored);
-                    if (matched == null) continue;
-
-                    shulkerCounts.computeIfAbsent(matched.getId(), k -> new int[]{0, resolveStackSize(slot, matched)});
-                    shulkerCounts.get(matched.getId())[0] += slot.getAmount();
+                    MonitoredItem mi = matchItem(slot, monitored);
+                    if (mi == null) continue;
+                    shulkerCounts.computeIfAbsent(mi.getId(), k -> new int[]{0, stackSizeOf(slot, mi)});
+                    shulkerCounts.get(mi.getId())[0] += slot.getAmount();
                 }
 
-                for (Map.Entry<String, int[]> entry : shulkerCounts.entrySet()) {
-                    String miId      = entry.getKey();
-                    int    total     = entry.getValue()[0];
-                    int    stackSize = entry.getValue()[1];
+                for (Map.Entry<String, int[]> e : shulkerCounts.entrySet()) {
+                    String miId      = e.getKey();
+                    int    total     = e.getValue()[0];
+                    int    stackSize = e.getValue()[1];
                     int    stacks    = (int) Math.ceil((double) total / stackSize);
 
                     MonitoredItem mi = findById(monitored, miId);
                     if (mi == null) continue;
                     int threshold = mi.getThresholdShulker();
-                    if (threshold < 0) continue; // disabled
+                    if (threshold < 0) continue;
 
-                    if (dbg) {
-                        plugin.getLogger().info("[DEBUG] " + playerName + " shulker=" + shulkerName +
-                                " | item='" + miId + "' total=" + total + " threshold=" + threshold);
-                    }
+                    if (dbg) log.info("[DEBUG] " + p.playerName + " shulker=" + shulkerType +
+                            " | item='" + miId + "' total=" + total + " threshold=" + threshold);
 
-                    if (total < threshold) continue; // threshold is raw item count
+                    if (total < threshold) continue;
 
-                    AlertSource src = isChest ? AlertSource.SHULKER_IN_CHEST : AlertSource.SHULKER_IN_INVENTORY;
-                    String coolKey  = uuid + ":" + miId + ":" + src.name() + ":" + shulkerName;
-                    if (isOnCooldown(coolKey)) {
-                        if (dbg) plugin.getLogger().info("[DEBUG] On cooldown for " + coolKey);
-                        continue;
-                    }
-                    setCooldown(coolKey);
+                    AlertSource src     = p.isChest ? AlertSource.SHULKER_IN_CHEST : AlertSource.SHULKER_IN_INVENTORY;
+                    String      coolKey = p.uuid + ":" + miId + ":" + src.name() + ":" + shulkerType;
+                    if (checkAndSetCooldown(coolKey, cfg, dbg)) continue;
 
                     String label = mi.getMaterial() != null ? mi.getMaterial().name() : miId;
-
-                    results.add(new AlertData(uuid, playerName, playerLoc, chestLoc, label,
-                            stacks, total, src, prettyName(shulkerName), mi.getBanLimit(), mi.getBanReason()));
+                    results.add(new AlertData(p.uuid, p.playerName, p.playerLoc, p.chestLoc, label,
+                            stacks, total, src, prettyName(shulkerType), mi.getBanLimit(), mi.getBanReason()));
                 }
             }
         }
@@ -290,52 +288,49 @@ public class InventoryScanner {
         return results;
     }
 
-    // ── Item matching ─────────────────────────────────────────────────────────
+    // ══ Item matching — no Bukkit API, uses pre-cloned ItemStack data ═════════
 
     /**
-     * Checks if an item matches any monitored item — by material first, then by name keywords.
-     * Returns the first matching MonitoredItem, or null.
+     * Matches an item by material, then by display-name keyword.
+     * {@code item.getItemMeta()} is called here — this is safe because
+     * {@code item} is a clone made on the main thread during snapshotting.
+     * Cloned ItemStacks can have their meta read from any thread.
      */
     private MonitoredItem matchItem(ItemStack item, List<MonitoredItem> monitored) {
-        // 1. Material match (fast)
+        // Fast material match
         for (MonitoredItem mi : monitored) {
             if (mi.matchesMaterial(item.getType())) return mi;
         }
 
-        // 2. Display name keyword match
-        String displayName = getDisplayName(item);
-        if (displayName != null) {
-            String lower = displayName.toLowerCase();
+        // Display name keyword match (reads meta of a pre-cloned ItemStack — safe)
+        String name = getDisplayName(item);
+        if (name != null) {
+            String lower = name.toLowerCase();
             for (MonitoredItem mi : monitored) {
                 if (mi.matchesName(lower) != null) return mi;
             }
         }
-
         return null;
     }
 
-    /**
-     * Gets the plain display name of an item using the Adventure API, or null if it has none.
-     * Uses Adventure's {@code PlainTextComponentSerializer} so color/formatting is stripped.
-     */
+    /** Strips color/formatting from an item's display name. Cloned ItemStack — thread-safe. */
     private static String getDisplayName(ItemStack item) {
         ItemMeta meta = item.getItemMeta();
         if (meta == null || !meta.hasDisplayName()) return null;
-        // Adventure API — returns plain text with all formatting stripped
         net.kyori.adventure.text.Component comp = meta.displayName();
         if (comp == null) return null;
         return net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer
                 .plainText().serialize(comp).trim();
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ══ Helpers ═══════════════════════════════════════════════════════════════
 
-    private int resolveStackSize(ItemStack item, MonitoredItem mi) {
+    private static int stackSizeOf(ItemStack item, MonitoredItem mi) {
         if (mi.getMaterial() != null) return mi.getMaterial().getMaxStackSize();
         return item.getType().getMaxStackSize();
     }
 
-    private MonitoredItem findById(List<MonitoredItem> items, String id) {
+    private static MonitoredItem findById(List<MonitoredItem> items, String id) {
         for (MonitoredItem mi : items) {
             if (mi.getId().equals(id)) return mi;
         }
@@ -346,20 +341,22 @@ public class InventoryScanner {
         return type.name().endsWith("SHULKER_BOX");
     }
 
-    private boolean isOnCooldown(String key) {
-        Long last = cooldowns.get(key);
-        if (last == null) return false;
-        return (System.currentTimeMillis() - last) < plugin.getPluginConfig().getAlertCooldownSeconds() * 1000L;
-    }
-
-    private void setCooldown(String key) {
-        cooldowns.put(key, System.currentTimeMillis());
-    }
-
     /**
-     * Deep-copies an ItemStack array. Each non-null element is cloned.
-     * This ensures complete thread-safety for async analysis.
+     * Returns true if {@code key} is on cooldown (skips alert), false if it was just set.
+     * Thread-safe via {@link ConcurrentHashMap}.
      */
+    private boolean checkAndSetCooldown(String key, PluginConfig cfg, boolean dbg) {
+        long now  = System.currentTimeMillis();
+        Long last = cooldowns.get(key);
+        if (last != null && (now - last) < cfg.getAlertCooldownSeconds() * 1000L) {
+            if (dbg) log.info("[DEBUG] On cooldown for " + key);
+            return true; // still on cooldown
+        }
+        cooldowns.put(key, now);
+        return false;
+    }
+
+    /** Deep-copies an ItemStack array. Each non-null slot is cloned (main thread). */
     private static ItemStack[] deepCopy(ItemStack[] source) {
         ItemStack[] copy = new ItemStack[source.length];
         for (int i = 0; i < source.length; i++) {
@@ -380,4 +377,24 @@ public class InventoryScanner {
         }
         return sb.toString();
     }
+
+    // ══ ScanPayload — immutable carrier between main thread and virtual thread ═
+
+    /**
+     * Fully immutable snapshot of everything needed for one scan cycle.
+     * Created on the main thread; consumed on a virtual thread.
+     *
+     * <p>All arrays are deep-copies. {@code chestLoc} may be null for player scans.</p>
+     */
+    private record ScanPayload(
+            UUID          uuid,
+            String        playerName,
+            Location      playerLoc,
+            Location      chestLoc,      // null for player inventory scans
+            boolean       isChest,
+            ItemStack[]   outerSlots,    // deep-copied outer inventory
+            ItemStack[][] shulkerSlots,  // [slotIndex] = deep-copied inner inv, or null
+            String[]      shulkerTypes,  // [slotIndex] = material name of shulker, or null
+            PluginConfig  cfg            // config snapshot at submission time
+    ) {}
 }
