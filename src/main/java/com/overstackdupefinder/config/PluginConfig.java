@@ -32,6 +32,8 @@ public class PluginConfig {
     private String              autoBanCommand;
     private String              autoBanReason;
     private boolean             autoBanNotifyDiscord;
+    // Whitelist
+    private List<String>        whitelistedPlayers;
 
     public PluginConfig(OverStackDupeFinder plugin) {
         this.plugin = plugin;
@@ -57,6 +59,15 @@ public class PluginConfig {
         autoBanCommand       = cfg.getString("auto-ban.command", "ban {player} {reason}");
         autoBanReason        = cfg.getString("auto-ban.reason", "Suspicious item stash detected by OverStackDupeFinder");
         autoBanNotifyDiscord = cfg.getBoolean("auto-ban.notify-discord", true);
+
+        // Whitelist
+        whitelistedPlayers   = new ArrayList<>();
+        List<String> rawWhitelist = cfg.getStringList("whitelisted-players");
+        for (String p : rawWhitelist) {
+            if (p != null && !p.isBlank()) {
+                whitelistedPlayers.add(p.trim().toLowerCase());
+            }
+        }
 
         if (autoBanEnabled) {
             plugin.getLogger().info("[AutoBan] Enabled — command: " + autoBanCommand);
@@ -147,4 +158,10 @@ public class PluginConfig {
     public String              getAutoBanCommand()      { return autoBanCommand; }
     public String              getAutoBanReason()       { return autoBanReason; }
     public boolean             isAutoBanNotifyDiscord() { return autoBanNotifyDiscord; }
+    // Whitelist
+    public List<String>        getWhitelistedPlayers()  { return Collections.unmodifiableList(whitelistedPlayers); }
+    public boolean             isWhitelisted(String name) {
+        if (name == null) return false;
+        return whitelistedPlayers.contains(name.trim().toLowerCase());
+    }
 }

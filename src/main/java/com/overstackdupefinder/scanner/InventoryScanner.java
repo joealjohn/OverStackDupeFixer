@@ -69,6 +69,11 @@ public class InventoryScanner {
 
     /** Snapshots a single player's inventory and submits async analysis. */
     public void snapshotAndScanPlayer(Player player) {
+        if (player.hasPermission("overstackdupefinder.bypass")
+                || plugin.getPluginConfig().isWhitelisted(player.getName())) {
+            return;
+        }
+
         ItemStack[] raw      = player.getInventory().getContents();
         ScanPayload payload  = buildPayload(raw, player.getUniqueId(), player.getName(),
                                             player.getLocation().clone(), null, false);
@@ -78,6 +83,11 @@ public class InventoryScanner {
     /** Snapshots a chest and submits async analysis. */
     public void snapshotAndScanChest(ItemStack[] chestContents, Player player,
                                      Location playerLoc, Location chestLoc) {
+        if (player.hasPermission("overstackdupefinder.bypass")
+                || plugin.getPluginConfig().isWhitelisted(player.getName())) {
+            return;
+        }
+
         ScanPayload payload = buildPayload(chestContents, player.getUniqueId(), player.getName(),
                                            playerLoc.clone(),
                                            chestLoc != null ? chestLoc.clone() : null,

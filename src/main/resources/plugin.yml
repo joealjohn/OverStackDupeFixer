@@ -17,3 +17,7 @@ permissions:
   overstackdupefinder.admin:
     description: Access to /overstackdupe command
     default: op
+  overstackdupefinder.bypass:
+    description: Bypass all inventory and chest scanning
+    default: false
+

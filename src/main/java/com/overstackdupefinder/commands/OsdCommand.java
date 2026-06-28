@@ -78,6 +78,7 @@ public class OsdCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage("§7  Scan interval:              §f" + cfg.getScanIntervalSeconds() + "s");
         sender.sendMessage("§7  Alert cooldown:             §f" + cfg.getAlertCooldownSeconds() + "s");
         sender.sendMessage("§7  Debug mode:                 §f" + cfg.isDebug());
+        sender.sendMessage("§7  Whitelisted players:        §f" + cfg.getWhitelistedPlayers());
         sender.sendMessage("§7  Monitored items:");
         for (MonitoredItem mi : cfg.getMonitoredItems()) {
             sender.sendMessage("§7    §e" + mi.getId() + " §7→ mat=" + mi.getMaterial()

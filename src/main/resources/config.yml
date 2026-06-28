@@ -42,7 +42,7 @@ monitored-items:
       - "spawner"              # catches "Zombie Spawner", "Iron Golem Spawner", etc.
     alert-in-inventory: 640   # ALERT if player has this many items loose in inventory
     alert-in-shulker: 320     # ALERT if one shulker has this many items inside
-    ban-limit: 1280           # AUTO-BAN if they have this many items (must be ≥ alert)
+    ban-limit: 1580         # AUTO-BAN if they have this many items (must be ≥ alert)
     ban-reason: "velo-panikum-poda"
 
   netherite-blocks:
@@ -153,3 +153,14 @@ auto-ban:
 
   # Send a separate green Discord embed when the ban is executed?
   notify-discord: true
+
+# ──────────────────────────────────────────────────────────
+# WHITELISTED PLAYERS
+# ──────────────────────────────────────────────────────────
+# Players added to this list will never trigger alerts or auto-bans.
+# Useful for admins or staff testing features. Case-insensitive.
+# You can also grant players the permission node 'overstackdupefinder.bypass'
+# to achieve the same result.
+whitelisted-players:
+  - "Ace"
+  - "Console"
